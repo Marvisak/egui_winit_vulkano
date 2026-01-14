@@ -95,8 +95,6 @@ pub struct Renderer {
     #[allow(unused)]
     format: vulkano::format::Format,
     font_sampler: Arc<Sampler>,
-    // May be R8G8_UNORM or R8G8B8A8_SRGB
-    font_format: Format,
 
     allocators: Allocators,
     vertex_index_buffer_pool: SubbufferAllocator,
@@ -174,24 +172,28 @@ impl Renderer {
             // final_output_format.type_color().unwrap() == NumericType::SRGB;
             final_output_format.numeric_format_color().unwrap() == NumericFormat::SRGB;
         let allocators = Allocators::new_default(gfx_queue.device());
-        let vertex_index_buffer_pool =
-            SubbufferAllocator::new(allocators.memory.clone(), SubbufferAllocatorCreateInfo {
+        let vertex_index_buffer_pool = SubbufferAllocator::new(
+            allocators.memory.clone(),
+            SubbufferAllocatorCreateInfo {
                 arena_size: INDEX_BUFFER_SIZE + VERTEX_BUFFER_SIZE,
                 buffer_usage: BufferUsage::INDEX_BUFFER | BufferUsage::VERTEX_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
-            });
+            },
+        );
         let pipeline = Self::create_pipeline(gfx_queue.clone(), subpass.clone());
-        let font_sampler = Sampler::new(gfx_queue.device().clone(), SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::ClampToEdge; 3],
-            mipmap_mode: SamplerMipmapMode::Linear,
-            ..Default::default()
-        })
+        let font_sampler = Sampler::new(
+            gfx_queue.device().clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                mipmap_mode: SamplerMipmapMode::Linear,
+                ..Default::default()
+            },
+        )
         .unwrap();
-        let font_format = Self::choose_font_format(gfx_queue.device());
         Renderer {
             gfx_queue,
             format: final_output_format,
@@ -205,7 +207,6 @@ impl Renderer {
             is_overlay,
             output_in_linear_colorspace,
             font_sampler,
-            font_format,
             allocators,
         }
     }
@@ -268,22 +269,28 @@ impl Renderer {
         )
         .unwrap();
 
-        GraphicsPipeline::new(gfx_queue.device().clone(), None, GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state,
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState::default()),
-            multisample_state: Some(MultisampleState {
-                rasterization_samples: subpass.num_samples().unwrap_or(SampleCount::Sample1),
-                ..Default::default()
-            }),
-            color_blend_state: Some(blend_state),
-            depth_stencil_state,
-            dynamic_state: [DynamicState::Viewport, DynamicState::Scissor].into_iter().collect(),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        })
+        GraphicsPipeline::new(
+            gfx_queue.device().clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state,
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState {
+                    rasterization_samples: subpass.num_samples().unwrap_or(SampleCount::Sample1),
+                    ..Default::default()
+                }),
+                color_blend_state: Some(blend_state),
+                depth_stencil_state,
+                dynamic_state: [DynamicState::Viewport, DynamicState::Scissor]
+                    .into_iter()
+                    .collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
         .unwrap()
     }
 
@@ -326,72 +333,12 @@ impl Renderer {
     }
     /// Choose a font format, attempt to minimize memory footprint and CPU unpacking time
     /// by choosing a swizzled linear format.
-    fn choose_font_format(device: &vulkano::device::Device) -> Format {
-        // Some portability subset devices are unable to swizzle views.
-        let supports_swizzle =
-            !device.physical_device().supported_extensions().khr_portability_subset
-                || device.physical_device().supported_features().image_view_format_swizzle;
-        // Check that this format is supported for all our uses:
-        let is_supported = |device: &vulkano::device::Device, format: Format| {
-            device
-                .physical_device()
-                .image_format_properties(vulkano::image::ImageFormatInfo {
-                    format,
-                    usage: ImageUsage::SAMPLED
-                        | ImageUsage::TRANSFER_DST
-                        | ImageUsage::TRANSFER_SRC,
-                    ..Default::default()
-                })
-                // Ok(Some(..)) is supported format for this usage.
-                .is_ok_and(|properties| properties.is_some())
-        };
-        if supports_swizzle && is_supported(device, Format::R8G8_UNORM) {
-            // We can save mem by swizzling in hardware!
-            Format::R8G8_UNORM
-        } else {
-            // Rest of implementation assumes R8G8B8A8_SRGB anyway!
-            Format::R8G8B8A8_SRGB
-        }
-    }
-    /// Based on self.font_format, extract into bytes.
-    fn pack_font_data_into(&self, data: &egui::FontImage, into: &mut [u8]) {
-        match self.font_format {
-            Format::R8G8_UNORM => {
-                // Egui expects RGB to be linear in shader, but alpha to be *nonlinear.*
-                // Thus, we use R channel for linear coverage, G for the same coverage converted to nonlinear.
-                // Then gets swizzled up to RRRG to match expected values.
-                let linear =
-                    data.pixels.iter().map(|f| (f.clamp(0.0, 1.0 - f32::EPSILON) * 256.0) as u8);
-                let bytes = linear
-                    .zip(data.srgba_pixels(None))
-                    .flat_map(|(linear, srgb)| [linear, srgb.a()]);
 
-                into.iter_mut().zip(bytes).for_each(|(into, from)| *into = from);
-            }
-            Format::R8G8B8A8_SRGB => {
-                // No special tricks, pack them directly.
-                let bytes = data.srgba_pixels(None).flat_map(|color| color.to_array());
-                into.iter_mut().zip(bytes).for_each(|(into, from)| *into = from);
-            }
-            // This is the exhaustive list of choosable font formats.
-            _ => unreachable!(),
-        }
-    }
     fn image_size_bytes(&self, delta: &egui::epaint::ImageDelta) -> usize {
         match &delta.image {
             egui::ImageData::Color(c) => {
                 // Always four bytes per pixel for sRGBA
                 c.width() * c.height() * 4
-            }
-            egui::ImageData::Font(f) => {
-                f.width()
-                    * f.height()
-                    * match self.font_format {
-                        Format::R8G8_UNORM => 2,
-                        Format::R8G8B8A8_SRGB => 4,
-                        // Exhaustive list of valid font formats
-                        _ => unreachable!(),
-                    }
             }
         }
     }
@@ -415,11 +362,6 @@ impl Renderer {
                 let bytes = image.pixels.iter().flat_map(|color| color.to_array());
                 mapped_stage.iter_mut().zip(bytes).for_each(|(into, from)| *into = from);
                 Format::R8G8B8A8_SRGB
-            }
-            egui::ImageData::Font(image) => {
-                // Dynamically pack based on chosen format
-                self.pack_font_data_into(image, mapped_stage);
-                self.font_format
             }
         };
 
@@ -481,10 +423,10 @@ impl Renderer {
                 },
                 _ => ComponentMapping::identity(),
             };
-            let view = ImageView::new(img.clone(), ImageViewCreateInfo {
-                component_mapping,
-                ..ImageViewCreateInfo::from_image(&img)
-            })
+            let view = ImageView::new(
+                img.clone(),
+                ImageViewCreateInfo { component_mapping, ..ImageViewCreateInfo::from_image(&img) },
+            )
             .unwrap();
             // Create a descriptor for it
             let layout = self.pipeline.layout().set_layouts().first().unwrap();
@@ -951,10 +893,10 @@ impl Renderer {
                             pixels_per_point: scale_factor,
                             screen_size_px: framebuffer_dimensions,
                         };
-                        (callback_fn.f)(info, &mut CallbackContext {
-                            builder,
-                            resources: self.render_resources(),
-                        });
+                        (callback_fn.f)(
+                            info,
+                            &mut CallbackContext { builder, resources: self.render_resources() },
+                        );
 
                         // The user could have done much here - rebind pipes, set views, bind things, etc.
                         // Mark all state as lost so that next mesh rebinds everything to a known state.
